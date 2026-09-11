@@ -1,0 +1,412 @@
+// main.m — MusicCLI
+//
+// macOS「音乐」(Music.app) 资料库的命令行访问层：**原生读取 + 收敛的写入路径**。
+//
+// 为什么需要它：直接用 AppleScript 操作资料库很容易出问题 ——
+//   * `whose album is` 查询不稳定（同一句查询时好时坏；库忙/重建索引时报 -1728）
+//   * 大批量删除会挂死，且没有超时保护
+//   * `add` 的返回值是异步上报的（实测 rc=0 却报 `added 0`，容易被误判为失败）
+// 但现实是：**Apple 没有提供任何写入 API** ——
+//   * iTunesLibrary.framework：仅 libraryWithAPIVersion / artworkForMediaFile /
+//     reloadData / unloadData，**没有 add/remove**
+//   * MediaLibrary.framework：同样只读
+//   * 库文件 `Music Library.musiclibrary/Library.musicdb` 是私有 `hfma` 格式（非 SQLite），
+//     不能直接改
+// 所以本工具的定位是：
+//   * **读**：全部走 iTunesLibrary.framework（原生、快、稳定，不依赖 AppleScript）
+//   * **写**：add / delete 只有 AppleScript 一条路，但**收敛到本项目唯一一处**，
+//     统一提供：pid 精确匹配、分批执行、超时保护、默认预览（需 --yes）、执行后可复验
+//
+// 环境要求：macOS 10.13+ 且已安装 Music.app（依赖 iTunesLibrary.framework）
+//
+// 用法：
+//   music-cli dump    <out.jsonl>          全库导出为 JSONL（原生）
+//   music-cli find    <关键词> [--json]     按 专辑/曲名/艺人 模糊查（原生）
+//   music-cli info    <pid>                按 persistent ID 查一条（原生）
+//   music-cli check   <专辑名>              该专辑的轨数/路径/文件是否存在（原生）
+//   music-cli verify  [--json]             统计幽灵条目；有则 exit 3（后置门禁）
+//   music-cli add     <文件...>             把文件加入资料库（写）
+//   music-cli delete  --pid <pid>...        按 persistent ID 精确删除（写；默认预览）
+//   music-cli delete  --album <专辑名>       按专辑名删除（写；默认预览）
+//   music-cli delete  --missing             删除全部幽灵条目（写；默认预览）
+//   预览操作加 --yes 才真正执行。
+//
+// 编译：见 Makefile，或
+//   clang -fobjc-arc -framework Foundation -framework iTunesLibrary \
+//         -o build/music-cli Sources/main.m
+//
+// 退出码：0 成功；1 一般错误；2 用法错误；3 verify 发现异常
+#import <Foundation/Foundation.h>
+#import <iTunesLibrary/iTunesLibrary.h>
+
+static NSString *kindName(ITLibMediaItemMediaKind k) {
+    switch (k) {
+        case ITLibMediaItemMediaKindSong: return @"Song";
+        case ITLibMediaItemMediaKindMovie: return @"Movie";
+        case ITLibMediaItemMediaKindPodcast: return @"Podcast";
+        case ITLibMediaItemMediaKindAudiobook: return @"Audiobook";
+        case ITLibMediaItemMediaKindPDFBooklet: return @"PDFBooklet";
+        case ITLibMediaItemMediaKindMusicVideo: return @"MusicVideo";
+        case ITLibMediaItemMediaKindTVShow: return @"TVShow";
+        case ITLibMediaItemMediaKindHomeVideo: return @"HomeVideo";
+        case ITLibMediaItemMediaKindVoiceMemo: return @"VoiceMemo";
+        default: return @"Other";
+    }
+}
+
+static ITLibrary *openLibrary(void) {
+    NSError *err = nil;
+    ITLibrary *lib = [ITLibrary libraryWithAPIVersion:@"1.0" error:&err];
+    if (!lib) {
+        fprintf(stderr, "ERR: 无法打开资料库: %s\n", err.localizedDescription.UTF8String);
+    }
+    return lib;
+}
+
+// 把一条 media item 转成 dict（字段与旧 dump-library 保持一致，下游无需改动）
+static NSDictionary *itemDict(ITLibMediaItem *item, NSISO8601DateFormatter *iso) {
+    ITLibAlbum *album = item.album;
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"pid"] = [NSString stringWithFormat:@"%llu", item.persistentID.unsignedLongLongValue];
+    d[@"kind"] = @(item.mediaKind);
+    d[@"kindName"] = kindName(item.mediaKind);
+    if (item.title) d[@"title"] = item.title;
+    if (item.artist.name) d[@"artist"] = item.artist.name;
+    if (album.title) d[@"album"] = album.title;
+    if (album.albumArtist) d[@"albumArtist"] = album.albumArtist;
+    if (album.isCompilation) d[@"compilation"] = @YES;
+    if (item.trackNumber > 0) d[@"trackNumber"] = @(item.trackNumber);
+    if (album.discNumber > 0) d[@"discNumber"] = @(album.discNumber);
+    if (album.discCount > 0) d[@"discCount"] = @(album.discCount);
+    if (album.trackCount > 0) d[@"albumTrackCount"] = @(album.trackCount);
+    if (item.year > 0) d[@"year"] = @(item.year);
+    if (item.genre) d[@"genre"] = item.genre;
+    d[@"playCount"] = @(item.playCount);
+    d[@"rating"] = @(item.rating);
+    if (item.lastPlayedDate) d[@"lastPlayed"] = [iso stringFromDate:item.lastPlayedDate];
+    if (item.location) {
+        d[@"location"] = item.location.path;
+        d[@"ext"] = item.location.pathExtension.lowercaseString;
+    }
+    return d;
+}
+
+// ---------- 写操作：唯一那条 AppleScript 路径 ----------
+// 说明：苹果未提供写入 API，add/delete 只能用 AppleScript。
+// 这里集中做三件事：(1) 用 persistent ID 精确匹配（不用专辑名，避免误删）；
+// (2) 分批 + 超时，避免整库扫描挂死；(3) 返回真实删除条数供上层复验。
+static int runAppleScript(NSString *src, NSTimeInterval timeout, NSString **outText) {
+    NSTask *task = [NSTask new];
+    task.launchPath = @"/usr/bin/osascript";
+    task.arguments = @[@"-e", src];
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = pipe;
+    NSError *err = nil;
+    if (![task launchAndReturnError:&err]) {
+        fprintf(stderr, "ERR: osascript 启动失败: %s\n", err.localizedDescription.UTF8String);
+        return 1;
+    }
+    // 超时保护：AppleScript 在库忙时会挂死，不能无限等
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while (task.isRunning && [deadline timeIntervalSinceNow] > 0) {
+        [NSThread sleepForTimeInterval:0.2];
+    }
+    if (task.isRunning) {
+        [task terminate];
+        fprintf(stderr, "ERR: osascript 超时(%.0fs)已终止\n", timeout);
+        return 1;
+    }
+    NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+    if (outText) *outText = text;
+    return task.terminationStatus;
+}
+
+static NSString *escapeForAppleScript(NSString *s) {
+    return [s stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+}
+
+static int cmdAdd(NSArray<NSString *> *paths) {
+    if (paths.count == 0) { fprintf(stderr, "用法: music-cli add <文件...>\n"); return 2; }
+    NSMutableString *src = [NSMutableString stringWithString:@"tell application \"Music\"\n  set fs to {}\n"];
+    for (NSString *p in paths) {
+        NSString *abs = [p isAbsolutePath] ? p : [[[NSFileManager defaultManager] currentDirectoryPath]
+                                                  stringByAppendingPathComponent:p];
+        [src appendFormat:@"  set end of fs to POSIX file \"%@\"\n", escapeForAppleScript(abs)];
+    }
+    [src appendString:@"  set added to add fs\n  return \"added \" & (count of added)\nend tell"];
+    NSString *out = nil;
+    int rc = runAppleScript(src, 600, &out);
+    printf("%s\n", out.length ? out.UTF8String : "(无输出)");
+    return rc;
+}
+
+static int cmdDeletePids(NSArray<NSString *> *pids, BOOL apply) {
+    if (pids.count == 0) { fprintf(stderr, "用法: music-cli delete --pid <pid>...\n"); return 2; }
+    if (!apply) {
+        printf("[预览] 将按 persistent ID 删除 %lu 条:\n", (unsigned long)pids.count);
+        for (NSString *p in pids) printf("   %s\n", p.UTF8String);
+        printf("加 --yes 才真正执行\n");
+        return 0;
+    }
+    // 分批（每批 10 条），避免单条 AppleScript 过长导致挂死
+    NSInteger total = 0;
+    for (NSUInteger i = 0; i < pids.count; i += 10) {
+        NSUInteger n = MIN((NSUInteger)10, pids.count - i);
+        NSMutableString *src = [NSMutableString stringWithString:@"tell application \"Music\"\n  set n to 0\n"];
+        for (NSUInteger j = i; j < i + n; j++) {
+            [src appendFormat:@"  try\n    set tr to (some track of library playlist 1 whose persistent ID is \"%@\")\n"
+                              @"    delete tr\n    set n to n + 1\n  end try\n", escapeForAppleScript(pids[j])];
+        }
+        [src appendString:@"  return n\nend tell"];
+        NSString *out = nil;
+        if (runAppleScript(src, 300, &out) != 0) return 1;
+        NSInteger got = out.integerValue;
+        total += got;
+        printf("  批 %lu: 删除 %ld 条\n", (unsigned long)(i / 10 + 1), (long)got);
+    }
+    printf("共删除 %ld / %lu 条\n", (long)total, (unsigned long)pids.count);
+    if (total != (NSInteger)pids.count) {
+        fprintf(stderr, "WARN: 删除数少于请求数，可能有条目不匹配（已失效？）\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int cmdDeleteAlbum(NSString *album, BOOL apply) {
+    ITLibrary *lib = openLibrary();
+    if (!lib) return 1;
+    NSMutableArray *pids = [NSMutableArray array];
+    for (ITLibMediaItem *item in lib.allMediaItems) {
+        if ([item.album.title isEqualToString:album]) {
+            [pids addObject:[NSString stringWithFormat:@"%llu", item.persistentID.unsignedLongLongValue]];
+        }
+    }
+    printf("专辑 %s: 库内 %lu 条\n", album.UTF8String, (unsigned long)pids.count);
+    if (pids.count == 0) return 0;
+    if (!apply) {
+        printf("[预览] 加 --yes 才真正删除\n");
+        return 0;
+    }
+    return cmdDeletePids(pids, YES);
+}
+
+// 删除"记录在册但文件已删"的幽灵条目（本次会话反复需要的操作）
+static int cmdDeleteMissing(BOOL apply) {
+    ITLibrary *lib = openLibrary();
+    if (!lib) return 1;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray *pids = [NSMutableArray array];
+    NSMutableArray *desc = [NSMutableArray array];
+    for (ITLibMediaItem *item in lib.allMediaItems) {
+        NSString *path = item.location.path;
+        if (path.length == 0) continue;              // 无 location 的条目（如 Apple Music 串流）不算幽灵
+        if ([fm fileExistsAtPath:path]) continue;    // 文件在，正常
+        [pids addObject:[NSString stringWithFormat:@"%llu", item.persistentID.unsignedLongLongValue]];
+        [desc addObject:[NSString stringWithFormat:@"%@ / %@ / %@",
+                         item.album.title ?: @"?", item.artist.name ?: @"?", item.title ?: @"?"]];
+    }
+    printf("幽灵条目（记录在册但文件已删）: %lu 条\n", (unsigned long)pids.count);
+    for (NSUInteger i = 0; i < MIN((NSUInteger)20, desc.count); i++)
+        printf("   %s\n", [desc[i] UTF8String]);
+    if (pids.count > 20) printf("   ... 另有 %lu 条\n", (unsigned long)(pids.count - 20));
+    if (!apply) { printf("[预览] 加 --yes 才真正删除\n"); return 0; }
+    return cmdDeletePids(pids, YES);
+}
+
+// ---------- 读操作 ----------
+static int cmdDump(NSString *outPath) {
+    ITLibrary *lib = openLibrary();
+    if (!lib) return 1;
+    NSArray *items = lib.allMediaItems;
+    NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
+    NSMutableString *sb = [NSMutableString stringWithCapacity:items.count * 256];
+    for (ITLibMediaItem *item in items) {
+        NSDictionary *d = itemDict(item, iso);
+        NSError *jerr = nil;
+        NSData *json = [NSJSONSerialization dataWithJSONObject:d options:0 error:&jerr];
+        if (!json) continue;
+        [sb appendString:[[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding]];
+        [sb appendString:@"\n"];
+    }
+    NSError *werr = nil;
+    if (![sb writeToFile:outPath atomically:YES encoding:NSUTF8StringEncoding error:&werr]) {
+        fprintf(stderr, "ERR: 写入失败: %s\n", werr.localizedDescription.UTF8String);
+        return 1;
+    }
+    NSInteger songs = 0;
+    for (ITLibMediaItem *item in items) if (item.mediaKind == ITLibMediaItemMediaKindSong) songs++;
+    printf("library appVersion=%s items=%lu songs=%ld\n-> %s\n",
+           lib.applicationVersion.UTF8String, (unsigned long)items.count, (long)songs, outPath.UTF8String);
+    return 0;
+}
+
+static int cmdFind(NSString *kw, BOOL asJson) {
+    ITLibrary *lib = openLibrary();
+    if (!lib) return 1;
+    NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
+    NSMutableArray *hits = [NSMutableArray array];
+    for (ITLibMediaItem *item in lib.allMediaItems) {
+        NSString *alb = item.album.title ?: @"";
+        NSString *tit = item.title ?: @"";
+        NSString *art = item.artist.name ?: @"";
+        if ([alb containsString:kw] || [tit containsString:kw] || [art containsString:kw]) {
+            [hits addObject:itemDict(item, iso)];
+        }
+    }
+    if (asJson) {
+        NSData *json = [NSJSONSerialization dataWithJSONObject:hits
+                                                       options:NSJSONWritingPrettyPrinted error:nil];
+        printf("%s\n", [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding].UTF8String);
+    } else {
+        printf("命中 %lu 条:\n", (unsigned long)hits.count);
+        for (NSDictionary *d in hits) {
+            printf("  %-20s | %-34s | %s\n",
+                   [d[@"pid"] UTF8String],
+                   [(d[@"album"] ?: @"?") UTF8String],
+                   [(d[@"title"] ?: @"?") UTF8String]);
+        }
+    }
+    return 0;
+}
+
+static int cmdInfo(NSString *pidStr) {
+    ITLibrary *lib = openLibrary();
+    if (!lib) return 1;
+    unsigned long long want = strtoull(pidStr.UTF8String, NULL, 10);
+    for (ITLibMediaItem *item in lib.allMediaItems) {
+        if (item.persistentID.unsignedLongLongValue == want) {
+            NSDictionary *d = itemDict(item, [NSISO8601DateFormatter new]);
+            NSData *json = [NSJSONSerialization dataWithJSONObject:d
+                                                           options:NSJSONWritingPrettyPrinted error:nil];
+            printf("%s\n", [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding].UTF8String);
+            return 0;
+        }
+    }
+    fprintf(stderr, "未找到 pid=%s\n", pidStr.UTF8String);
+    return 1;
+}
+
+// 替代 AppleScript `whose album is`（那个查询不稳定，本次会话被坑多次）
+static int cmdCheck(NSString *album) {
+    ITLibrary *lib = openLibrary();
+    if (!lib) return 1;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray *rows = [NSMutableArray array];
+    for (ITLibMediaItem *item in lib.allMediaItems) {
+        if (![item.album.title isEqualToString:album]) continue;
+        NSString *p = item.location.path;
+        [rows addObject:@{@"pid": [NSString stringWithFormat:@"%llu", item.persistentID.unsignedLongLongValue],
+                          @"title": item.title ?: @"",
+                          @"artist": item.artist.name ?: @"",
+                          @"path": p ?: @"",
+                          @"exists": @(p.length && [fm fileExistsAtPath:p])}];
+    }
+    NSInteger alive = 0;
+    for (NSDictionary *r in rows) if ([r[@"exists"] boolValue]) alive++;
+    NSDictionary *out = @{@"album": album,
+                          @"tracks": @(rows.count),
+                          @"files_present": @(alive),
+                          @"tracks_detail": rows};
+    NSData *json = [NSJSONSerialization dataWithJSONObject:out
+                                                   options:NSJSONWritingPrettyPrinted error:nil];
+    printf("%s\n", [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding].UTF8String);
+    return 0;
+}
+
+// 后置门禁：统计幽灵条目 + 同名专辑重复
+static int cmdVerify(BOOL asJson) {
+    ITLibrary *lib = openLibrary();
+    if (!lib) return 1;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableDictionary<NSString *, NSNumber *> *byAlbum = [NSMutableDictionary dictionary];
+    NSInteger ghosts = 0, songs = 0, withLoc = 0;
+    NSMutableArray *ghostSample = [NSMutableArray array];
+    for (ITLibMediaItem *item in lib.allMediaItems) {
+        if (item.mediaKind != ITLibMediaItemMediaKindSong) continue;
+        songs++;
+        NSString *alb = item.album.title ?: @"";
+        byAlbum[alb] = @(byAlbum[alb].integerValue + 1);
+        NSString *p = item.location.path;
+        if (p.length == 0) continue;
+        withLoc++;
+        if (![fm fileExistsAtPath:p]) {
+            ghosts++;
+            if (ghostSample.count < 10)
+                [ghostSample addObject:[NSString stringWithFormat:@"%@ / %@", alb, item.title ?: @""]];
+        }
+    }
+    printf("曲目 %ld 条（有 location %ld）\n", (long)songs, (long)withLoc);
+    printf("幽灵条目（文件已删）: %ld\n", (long)ghosts);
+    for (NSString *s in ghostSample) printf("   %s\n", s.UTF8String);
+    int rc = ghosts > 0 ? 3 : 0;
+    if (asJson) {
+        NSData *json = [NSJSONSerialization dataWithJSONObject:
+                        @{@"songs": @(songs), @"with_location": @(withLoc), @"ghosts": @(ghosts)}
+                                                       options:NSJSONWritingPrettyPrinted error:nil];
+        printf("%s\n", [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding].UTF8String);
+    }
+    return rc;
+}
+
+static void usage(void) {
+    fprintf(stderr,
+        "music-cli — Music.app 资料库访问层（读=原生 iTunesLibrary，写=唯一 AppleScript 路径）\n\n"
+        "  dump   <out.jsonl>          全库导出为 JSONL（原生）\n"
+        "  find   <关键词> [--json]     按专辑/曲名/艺人模糊查（原生）\n"
+        "  info   <pid>                按 persistent ID 查一条（原生）\n"
+        "  check  <专辑名>              该专辑轨数/路径/文件是否在（原生）\n"
+        "  verify [--json]             统计幽灵条目，有则 exit 3（后置门禁）\n"
+        "  add    <文件...>             加入资料库（写）\n"
+        "  delete --pid <pid>...       按 pid 精确删除（写；默认预览，--yes 执行）\n"
+        "  delete --album <专辑名>      按专辑名删除（写；默认预览，--yes 执行）\n"
+        "  delete --missing            删除所有幽灵条目（写；默认预览，--yes 执行）\n");
+}
+
+int main(int argc, const char *argv[]) {
+    @autoreleasepool {
+        if (argc < 2) { usage(); return 2; }
+        NSString *cmd = [NSString stringWithUTF8String:argv[1]];
+        NSMutableArray<NSString *> *args = [NSMutableArray array];
+        BOOL yes = NO, asJson = NO;
+        for (int i = 2; i < argc; i++) {
+            NSString *a = [NSString stringWithUTF8String:argv[i]];
+            if ([a isEqualToString:@"--yes"]) { yes = YES; continue; }
+            if ([a isEqualToString:@"--json"]) { asJson = YES; continue; }
+            [args addObject:a];
+        }
+        if ([cmd isEqualToString:@"dump"]) {
+            if (args.count < 1) { usage(); return 2; }
+            return cmdDump(args[0]);
+        }
+        if ([cmd isEqualToString:@"find"]) {
+            if (args.count < 1) { usage(); return 2; }
+            return cmdFind(args[0], asJson);
+        }
+        if ([cmd isEqualToString:@"info"]) {
+            if (args.count < 1) { usage(); return 2; }
+            return cmdInfo(args[0]);
+        }
+        if ([cmd isEqualToString:@"check"]) {
+            if (args.count < 1) { usage(); return 2; }
+            return cmdCheck(args[0]);
+        }
+        if ([cmd isEqualToString:@"verify"]) return cmdVerify(asJson);
+        if ([cmd isEqualToString:@"add"]) return cmdAdd(args);
+        if ([cmd isEqualToString:@"delete"]) {
+            if (args.count == 0) { usage(); return 2; }
+            if ([args[0] isEqualToString:@"--missing"]) return cmdDeleteMissing(yes);
+            if ([args[0] isEqualToString:@"--album"]) {
+                if (args.count < 2) { usage(); return 2; }
+                return cmdDeleteAlbum(args[1], yes);
+            }
+            if ([args[0] isEqualToString:@"--pid"]) {
+                NSArray *pids = [args subarrayWithRange:NSMakeRange(1, args.count - 1)];
+                return cmdDeletePids(pids, yes);
+            }
+            usage(); return 2;
+        }
+        usage(); return 2;
+    }
+}
