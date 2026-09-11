@@ -178,10 +178,36 @@ static NSString *normalizePersistentID(NSString *raw) {
     return [NSString stringWithFormat:@"%016llX", value];
 }
 
+/// 删除后**回读实时库**确认是否真的消失。
+///
+/// 为什么必须回读：Music 的删除是**异步落库**的，AppleScript 返回的计数只代表脚本执行完，
+/// 不代表库已经写完。曾经踩过：删完立刻用**旧快照**复查，以为"删了但还在"，
+/// 实际是快照过期（真删成功了）；反过来也可能出现脚本报成功、库却没删。
+/// 因此唯一可信的判定是「删完 → 重新打开库 → 看还在不在」。
+static NSInteger countStillPresent(NSArray<NSString *> *hexIDs) {
+    ITLibrary *lib = [ITLibrary libraryWithAPIVersion:@"1.0" error:nil];
+    if (!lib) return -1;                       // -1 表示无法判定，交由调用方提示
+    NSMutableSet<NSString *> *want = [NSMutableSet setWithArray:hexIDs];
+    NSInteger still = 0;
+    for (ITLibMediaItem *item in lib.allMediaItems) {
+        NSString *hex = [NSString stringWithFormat:@"%016llX", item.persistentID.unsignedLongLongValue];
+        if ([want containsObject:hex]) still++;
+    }
+    return still;
+}
+
 static int cmdDeletePids(NSArray<NSString *> *pids, BOOL apply) {
     if (pids.count == 0) { fprintf(stderr, "usage: music-cli delete --pid <pid>...\n"); return 2; }
     NSMutableArray<NSString *> *norm = [NSMutableArray arrayWithCapacity:pids.count];
     for (NSString *p in pids) [norm addObject:normalizePersistentID(p)];
+    // 去重：同一个 ID 传两次会让"删除数不符"误报
+    NSMutableArray<NSString *> *uniq = [NSMutableArray array];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    for (NSString *h in norm) if (![seen containsObject:h]) { [seen addObject:h]; [uniq addObject:h]; }
+    if (uniq.count != norm.count)
+        printf("note: %lu duplicate ID(s) removed from request\n", (unsigned long)(norm.count - uniq.count));
+    norm = uniq;
+
     if (!apply) {
         printf("[preview] would delete %lu item(s) by persistent ID:\n", (unsigned long)norm.count);
         for (NSUInteger i = 0; i < norm.count; i++)
@@ -189,7 +215,12 @@ static int cmdDeletePids(NSArray<NSString *> *pids, BOOL apply) {
         printf("pass --yes to actually run\n");
         return 0;
     }
-    // 分批（每批 10 条），避免单条 AppleScript 过长导致挂死
+    // 分批（每批 10 条），避免单条 AppleScript 过长导致挂死。
+    //
+    // 定位方式用 persistent ID：`iTunesLibrary.framework` **只暴露 persistentID**
+    // （ITLibMediaEntity 上除此之外没有 databaseID），所以无法从这里拿到 AppleScript 的
+    // `database ID`。persistent ID 查询本身是可靠的 —— 之前怀疑它"静默失败"，
+    // 真正的原因是复查时读了**过期快照**（删除其实成功了）。
     NSInteger total = 0;
     for (NSUInteger i = 0; i < norm.count; i += 10) {
         NSUInteger n = MIN((NSUInteger)10, norm.count - i);
@@ -205,12 +236,21 @@ static int cmdDeletePids(NSArray<NSString *> *pids, BOOL apply) {
         total += got;
         printf("  batch %lu: deleted %ld\n", (unsigned long)(i / 10 + 1), (long)got);
     }
+
+    // 回读实时库确认（异步落库，必须等一拍再看）
+    [NSThread sleepForTimeInterval:2.0];
+    NSInteger still = countStillPresent(norm);
     printf("deleted %ld / %lu\n", (long)total, (unsigned long)norm.count);
-    if (total != (NSInteger)norm.count) {
-        fprintf(stderr, "WARN: deleted fewer than requested; some IDs may not match (already gone?)\n");
-        return 1;
+    if (still < 0) {
+        fprintf(stderr, "WARN: could not reopen the library to verify; treat the result as unconfirmed\n");
+        return total == (NSInteger)norm.count ? 0 : 1;
     }
-    return 0;
+    if (still == 0) {
+        printf("verified: none of the requested IDs remain in the library\n");
+        return total == (NSInteger)norm.count ? 0 : 1;
+    }
+    fprintf(stderr, "ERROR: %ld requested ID(s) still present after delete — not removed\n", (long)still);
+    return 1;
 }
 
 static int cmdDeleteAlbum(NSString *album, BOOL apply) {
