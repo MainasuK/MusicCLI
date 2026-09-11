@@ -58,7 +58,7 @@ static ITLibrary *openLibrary(void) {
     NSError *err = nil;
     ITLibrary *lib = [ITLibrary libraryWithAPIVersion:@"1.0" error:&err];
     if (!lib) {
-        fprintf(stderr, "ERR: 无法打开资料库: %s\n", err.localizedDescription.UTF8String);
+        fprintf(stderr, "ERR: cannot open library: %s\n", err.localizedDescription.UTF8String);
     }
     return lib;
 }
@@ -104,7 +104,7 @@ static int runAppleScript(NSString *src, NSTimeInterval timeout, NSString **outT
     task.standardError = pipe;
     NSError *err = nil;
     if (![task launchAndReturnError:&err]) {
-        fprintf(stderr, "ERR: osascript 启动失败: %s\n", err.localizedDescription.UTF8String);
+        fprintf(stderr, "ERR: failed to launch osascript: %s\n", err.localizedDescription.UTF8String);
         return 1;
     }
     // 超时保护：AppleScript 在库忙时会挂死，不能无限等
@@ -114,7 +114,7 @@ static int runAppleScript(NSString *src, NSTimeInterval timeout, NSString **outT
     }
     if (task.isRunning) {
         [task terminate];
-        fprintf(stderr, "ERR: osascript 超时(%.0fs)已终止\n", timeout);
+        fprintf(stderr, "ERR: osascript timed out after %.0fs; terminated\n", timeout);
         return 1;
     }
     NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
@@ -128,7 +128,7 @@ static NSString *escapeForAppleScript(NSString *s) {
 }
 
 static int cmdAdd(NSArray<NSString *> *paths) {
-    if (paths.count == 0) { fprintf(stderr, "用法: music-cli add <文件...>\n"); return 2; }
+    if (paths.count == 0) { fprintf(stderr, "usage: music-cli add <file>...\n"); return 2; }
     NSMutableString *src = [NSMutableString stringWithString:@"tell application \"Music\"\n  set fs to {}\n"];
     for (NSString *p in paths) {
         NSString *abs = [p isAbsolutePath] ? p : [[[NSFileManager defaultManager] currentDirectoryPath]
@@ -138,7 +138,7 @@ static int cmdAdd(NSArray<NSString *> *paths) {
     [src appendString:@"  set added to add fs\n  return \"added \" & (count of added)\nend tell"];
     NSString *out = nil;
     int rc = runAppleScript(src, 600, &out);
-    printf("%s\n", out.length ? out.UTF8String : "(无输出)");
+    printf("%s\n", out.length ? out.UTF8String : "(no output)");
     return rc;
 }
 
@@ -179,14 +179,14 @@ static NSString *normalizePersistentID(NSString *raw) {
 }
 
 static int cmdDeletePids(NSArray<NSString *> *pids, BOOL apply) {
-    if (pids.count == 0) { fprintf(stderr, "用法: music-cli delete --pid <pid>...\n"); return 2; }
+    if (pids.count == 0) { fprintf(stderr, "usage: music-cli delete --pid <pid>...\n"); return 2; }
     NSMutableArray<NSString *> *norm = [NSMutableArray arrayWithCapacity:pids.count];
     for (NSString *p in pids) [norm addObject:normalizePersistentID(p)];
     if (!apply) {
-        printf("[预览] 将按 persistent ID 删除 %lu 条:\n", (unsigned long)norm.count);
+        printf("[preview] would delete %lu item(s) by persistent ID:\n", (unsigned long)norm.count);
         for (NSUInteger i = 0; i < norm.count; i++)
             printf("   %s → %s\n", pids[i].UTF8String, norm[i].UTF8String);
-        printf("加 --yes 才真正执行\n");
+        printf("pass --yes to actually run\n");
         return 0;
     }
     // 分批（每批 10 条），避免单条 AppleScript 过长导致挂死
@@ -203,11 +203,11 @@ static int cmdDeletePids(NSArray<NSString *> *pids, BOOL apply) {
         if (runAppleScript(src, 300, &out) != 0) return 1;
         NSInteger got = out.integerValue;
         total += got;
-        printf("  批 %lu: 删除 %ld 条\n", (unsigned long)(i / 10 + 1), (long)got);
+        printf("  batch %lu: deleted %ld\n", (unsigned long)(i / 10 + 1), (long)got);
     }
-    printf("共删除 %ld / %lu 条\n", (long)total, (unsigned long)norm.count);
+    printf("deleted %ld / %lu\n", (long)total, (unsigned long)norm.count);
     if (total != (NSInteger)norm.count) {
-        fprintf(stderr, "WARN: 删除数少于请求数，可能有条目不匹配（已失效？）\n");
+        fprintf(stderr, "WARN: deleted fewer than requested; some IDs may not match (already gone?)\n");
         return 1;
     }
     return 0;
@@ -222,10 +222,10 @@ static int cmdDeleteAlbum(NSString *album, BOOL apply) {
             [pids addObject:[NSString stringWithFormat:@"%llu", item.persistentID.unsignedLongLongValue]];
         }
     }
-    printf("专辑 %s: 库内 %lu 条\n", album.UTF8String, (unsigned long)pids.count);
+    printf("album %s: %lu item(s) in library\n", album.UTF8String, (unsigned long)pids.count);
     if (pids.count == 0) return 0;
     if (!apply) {
-        printf("[预览] 加 --yes 才真正删除\n");
+        printf("[preview] pass --yes to actually delete\n");
         return 0;
     }
     return cmdDeletePids(pids, YES);
@@ -246,11 +246,11 @@ static int cmdDeleteMissing(BOOL apply) {
         [desc addObject:[NSString stringWithFormat:@"%@ / %@ / %@",
                          item.album.title ?: @"?", item.artist.name ?: @"?", item.title ?: @"?"]];
     }
-    printf("幽灵条目（记录在册但文件已删）: %lu 条\n", (unsigned long)pids.count);
+    printf("ghost entries (recorded but file missing): %lu\n", (unsigned long)pids.count);
     for (NSUInteger i = 0; i < MIN((NSUInteger)20, desc.count); i++)
         printf("   %s\n", [desc[i] UTF8String]);
-    if (pids.count > 20) printf("   ... 另有 %lu 条\n", (unsigned long)(pids.count - 20));
-    if (!apply) { printf("[预览] 加 --yes 才真正删除\n"); return 0; }
+    if (pids.count > 20) printf("   ... and %lu more\n", (unsigned long)(pids.count - 20));
+    if (!apply) { printf("[preview] pass --yes to actually delete\n"); return 0; }
     return cmdDeletePids(pids, YES);
 }
 
@@ -271,7 +271,7 @@ static int cmdDump(NSString *outPath) {
     }
     NSError *werr = nil;
     if (![sb writeToFile:outPath atomically:YES encoding:NSUTF8StringEncoding error:&werr]) {
-        fprintf(stderr, "ERR: 写入失败: %s\n", werr.localizedDescription.UTF8String);
+        fprintf(stderr, "ERR: write failed: %s\n", werr.localizedDescription.UTF8String);
         return 1;
     }
     NSInteger songs = 0;
@@ -299,7 +299,7 @@ static int cmdFind(NSString *kw, BOOL asJson) {
                                                        options:NSJSONWritingPrettyPrinted error:nil];
         printf("%s\n", [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding].UTF8String);
     } else {
-        printf("命中 %lu 条:\n", (unsigned long)hits.count);
+        printf("%lu match(es):\n", (unsigned long)hits.count);
         for (NSDictionary *d in hits) {
             printf("  %-20s | %-34s | %s\n",
                    [d[@"pid"] UTF8String],
@@ -323,7 +323,7 @@ static int cmdInfo(NSString *pidStr) {
             return 0;
         }
     }
-    fprintf(stderr, "未找到 pid=%s\n", pidStr.UTF8String);
+    fprintf(stderr, "no item found for pid=%s\n", pidStr.UTF8String);
     return 1;
 }
 
@@ -376,8 +376,8 @@ static int cmdVerify(BOOL asJson) {
                 [ghostSample addObject:[NSString stringWithFormat:@"%@ / %@", alb, item.title ?: @""]];
         }
     }
-    printf("曲目 %ld 条（有 location %ld）\n", (long)songs, (long)withLoc);
-    printf("幽灵条目（文件已删）: %ld\n", (long)ghosts);
+    printf("tracks: %ld (with location: %ld)\n", (long)songs, (long)withLoc);
+    printf("ghost entries (file missing): %ld\n", (long)ghosts);
     for (NSString *s in ghostSample) printf("   %s\n", s.UTF8String);
     int rc = ghosts > 0 ? 3 : 0;
     if (asJson) {
@@ -391,16 +391,16 @@ static int cmdVerify(BOOL asJson) {
 
 static void usage(void) {
     fprintf(stderr,
-        "music-cli — Music.app 资料库访问层（读=原生 iTunesLibrary，写=唯一 AppleScript 路径）\n\n"
-        "  dump   <out.jsonl>          全库导出为 JSONL（原生）\n"
-        "  find   <关键词> [--json]     按专辑/曲名/艺人模糊查（原生）\n"
-        "  info   <pid>                按 persistent ID 查一条（原生）\n"
-        "  check  <专辑名>              该专辑轨数/路径/文件是否在（原生）\n"
-        "  verify [--json]             统计幽灵条目，有则 exit 3（后置门禁）\n"
-        "  add    <文件...>             加入资料库（写）\n"
-        "  delete --pid <pid>...       按 pid 精确删除（写；默认预览，--yes 执行）\n"
-        "  delete --album <专辑名>      按专辑名删除（写；默认预览，--yes 执行）\n"
-        "  delete --missing            删除所有幽灵条目（写；默认预览，--yes 执行）\n");
+        "music-cli — Music.app library access layer (reads = native iTunesLibrary, writes = one AppleScript path)\n\n"
+        "  dump   <out.jsonl>          Export the whole library as JSONL (native)\n"
+        "  find   <query> [--json]     Fuzzy search album / title / artist (native)\n"
+        "  info   <pid>                Look up one item by persistent ID (native)\n"
+        "  check  <album>              Track count, file paths, and whether files exist (native)\n"
+        "  verify [--json]             Count ghost entries; exits 3 if any (post-import gate)\n"
+        "  add    <file>...            Add files to the library (write)\n"
+        "  delete --pid <pid>...       Delete by exact persistent ID (write; preview, --yes to run)\n"
+        "  delete --album <album>      Delete by album name (write; preview, --yes to run)\n"
+        "  delete --missing            Delete every ghost entry (write; preview, --yes to run)\n");
 }
 
 int main(int argc, const char *argv[]) {
