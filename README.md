@@ -126,6 +126,10 @@ the command only prints what it *would* delete, so you can review it first.
   Passing decimal straight to AppleScript matches nothing and — worse — fails silently by deleting
   zero rows. `delete --pid` normalizes automatically (and accepts either form), and its preview
   prints both representations so you can confirm before executing.
+- **Deletions are asynchronous.** Music reports the AppleScript statement as done before the library
+  write lands. `delete` therefore re-opens the library afterwards and confirms the requested IDs are
+  actually gone, exiting non-zero if any survive. Don't verify a deletion against a dump you took
+  *before* deleting — that produces convincing but false "it's still there" reports.
 
 ## License
 
