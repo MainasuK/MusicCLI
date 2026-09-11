@@ -142,22 +142,61 @@ static int cmdAdd(NSArray<NSString *> *paths) {
     return rc;
 }
 
+/// 把 persistent ID 归一成 AppleScript 需要的形式。
+///
+/// **这是本工具最容易踩的坑**：iTunesLibrary.framework 读出来的 persistentID 是
+/// **十进制**（`unsignedLongLongValue`，如 `14996906945997447858`），而 AppleScript 的
+/// `persistent ID` 属性返回/接受的是 **16 位十六进制串**（如 `D01FB7690DC422B2`）。
+/// 直接把十进制喂给 AppleScript 会**一条都匹配不上**，且不报错（静默删 0 条）。
+/// 这里统一接受两种输入：纯十进制数字 → 转 16 位大写十六进制；已是十六进制则原样保留。
+static NSString *normalizePersistentID(NSString *raw) {
+    NSString *s = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    NSString *upper = s.uppercaseString;
+    // 已经是合法十六进制串（1~16 位，含 A-F）→ 补零到 16 位直接用
+    NSCharacterSet *hexSet = [NSCharacterSet characterSetWithCharactersInString:@"0123456789ABCDEF"];
+    BOOL allHex = s.length > 0 && s.length <= 16;
+    if (allHex) {
+        for (NSUInteger i = 0; i < upper.length; i++) {
+            if (![hexSet characterIsMember:[upper characterAtIndex:i]]) { allHex = NO; break; }
+        }
+    }
+    // 纯数字且位数较长（>16 位）必然是十进制 → 转十六进制
+    BOOL allDigits = s.length > 0;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        if (!isdigit((unsigned char)[s characterAtIndex:i])) { allDigits = NO; break; }
+    }
+    unsigned long long value = 0;
+    if (allDigits && s.length > 16) {
+        value = strtoull(s.UTF8String, NULL, 10);
+    } else if (allHex) {
+        value = strtoull(upper.UTF8String, NULL, 16);
+    } else if (allDigits) {
+        value = strtoull(s.UTF8String, NULL, 10);   // 短纯数字：按十进制理解
+    } else {
+        return upper;                                // 兜底：原样（含非法字符时交给 AppleScript 报错）
+    }
+    return [NSString stringWithFormat:@"%016llX", value];
+}
+
 static int cmdDeletePids(NSArray<NSString *> *pids, BOOL apply) {
     if (pids.count == 0) { fprintf(stderr, "用法: music-cli delete --pid <pid>...\n"); return 2; }
+    NSMutableArray<NSString *> *norm = [NSMutableArray arrayWithCapacity:pids.count];
+    for (NSString *p in pids) [norm addObject:normalizePersistentID(p)];
     if (!apply) {
-        printf("[预览] 将按 persistent ID 删除 %lu 条:\n", (unsigned long)pids.count);
-        for (NSString *p in pids) printf("   %s\n", p.UTF8String);
+        printf("[预览] 将按 persistent ID 删除 %lu 条:\n", (unsigned long)norm.count);
+        for (NSUInteger i = 0; i < norm.count; i++)
+            printf("   %s → %s\n", pids[i].UTF8String, norm[i].UTF8String);
         printf("加 --yes 才真正执行\n");
         return 0;
     }
     // 分批（每批 10 条），避免单条 AppleScript 过长导致挂死
     NSInteger total = 0;
-    for (NSUInteger i = 0; i < pids.count; i += 10) {
-        NSUInteger n = MIN((NSUInteger)10, pids.count - i);
+    for (NSUInteger i = 0; i < norm.count; i += 10) {
+        NSUInteger n = MIN((NSUInteger)10, norm.count - i);
         NSMutableString *src = [NSMutableString stringWithString:@"tell application \"Music\"\n  set n to 0\n"];
         for (NSUInteger j = i; j < i + n; j++) {
             [src appendFormat:@"  try\n    set tr to (some track of library playlist 1 whose persistent ID is \"%@\")\n"
-                              @"    delete tr\n    set n to n + 1\n  end try\n", escapeForAppleScript(pids[j])];
+                              @"    delete tr\n    set n to n + 1\n  end try\n", escapeForAppleScript(norm[j])];
         }
         [src appendString:@"  return n\nend tell"];
         NSString *out = nil;
@@ -166,8 +205,8 @@ static int cmdDeletePids(NSArray<NSString *> *pids, BOOL apply) {
         total += got;
         printf("  批 %lu: 删除 %ld 条\n", (unsigned long)(i / 10 + 1), (long)got);
     }
-    printf("共删除 %ld / %lu 条\n", (long)total, (unsigned long)pids.count);
-    if (total != (NSInteger)pids.count) {
+    printf("共删除 %ld / %lu 条\n", (long)total, (unsigned long)norm.count);
+    if (total != (NSInteger)norm.count) {
         fprintf(stderr, "WARN: 删除数少于请求数，可能有条目不匹配（已失效？）\n");
         return 1;
     }
