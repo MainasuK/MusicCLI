@@ -15,17 +15,17 @@ $(BIN): $(SRC) | $(BUILD)
 $(BUILD):
 	mkdir -p $(BUILD)
 
-# 安装到 /usr/local/bin（可按需改 PREFIX）
+# Install into /usr/local/bin (override with PREFIX=...)
 PREFIX ?= /usr/local
 install: $(BIN)
 	install -d $(PREFIX)/bin
 	install -m 755 $(BIN) $(PREFIX)/bin/music-cli
 
-# 只读自检：不修改资料库，仅验证各读命令可用
+# Read-only self-check: never modifies the library, only exercises the read commands.
 test: $(BIN)
-	@echo "--- verify (统计幽灵条目) ---"
+	@echo "--- verify (count ghost entries) ---"
 	@$(BIN) verify || true
-	@echo "--- find (模糊查，取前 5 条) ---"
+	@echo "--- find (fuzzy search, first 5) ---"
 	@$(BIN) find "" | head -5 || true
 
 clean:

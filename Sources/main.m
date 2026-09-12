@@ -1,41 +1,44 @@
 // main.m — MusicCLI
 //
-// macOS「音乐」(Music.app) 资料库的命令行访问层：**原生读取 + 收敛的写入路径**。
+// Command-line access to the macOS Music.app library: **native reads + one hardened write path**.
 //
-// 为什么需要它：直接用 AppleScript 操作资料库很容易出问题 ——
-//   * `whose album is` 查询不稳定（同一句查询时好时坏；库忙/重建索引时报 -1728）
-//   * 大批量删除会挂死，且没有超时保护
-//   * `add` 的返回值是异步上报的（实测 rc=0 却报 `added 0`，容易被误判为失败）
-// 但现实是：**Apple 没有提供任何写入 API** ——
-//   * iTunesLibrary.framework：仅 libraryWithAPIVersion / artworkForMediaFile /
-//     reloadData / unloadData，**没有 add/remove**
-//   * MediaLibrary.framework：同样只读
-//   * 库文件 `Music Library.musiclibrary/Library.musicdb` 是私有 `hfma` 格式（非 SQLite），
-//     不能直接改
-// 所以本工具的定位是：
-//   * **读**：全部走 iTunesLibrary.framework（原生、快、稳定，不依赖 AppleScript）
-//   * **写**：add / delete 只有 AppleScript 一条路，但**收敛到本项目唯一一处**，
-//     统一提供：pid 精确匹配、分批执行、超时保护、默认预览（需 --yes）、执行后可复验
+// Why this exists: driving the library with AppleScript is fragile in practice —
+//   * `whose album is` queries are unreliable (same query works then fails; returns -1728
+//     while the library is busy or reindexing)
+//   * bulk deletions hang, with no timeout protection
+//   * `add` reports asynchronously (observed rc=0 while printing `added 0`, easy to misread
+//     as a failure even though the tracks were imported)
+// The catch: **Apple ships no write API at all** —
+//   * iTunesLibrary.framework exposes only libraryWithAPIVersion / artworkForMediaFile /
+//     reloadData / unloadData — **no add/remove**
+//   * MediaLibrary.framework is read-only as well
+//   * the library file `Music Library.musiclibrary/Library.musicdb` uses a private `hfma`
+//     format (not SQLite) and cannot be edited directly
+// So this tool is deliberately split:
+//   * **reads** go entirely through iTunesLibrary.framework (native, fast, stable, no AppleScript)
+//   * **writes** (add/delete) have exactly one available route — AppleScript — so it is
+//     **confined to this single place**, hardened with exact persistent-ID matching, batching,
+//     timeouts, preview by default (--yes required), and verification afterwards
 //
-// 环境要求：macOS 10.13+ 且已安装 Music.app（依赖 iTunesLibrary.framework）
+// Requirements: macOS 10.13+ with Music.app installed (depends on iTunesLibrary.framework)
 //
-// 用法：
-//   music-cli dump    <out.jsonl>          全库导出为 JSONL（原生）
-//   music-cli find    <关键词> [--json]     按 专辑/曲名/艺人 模糊查（原生）
-//   music-cli info    <pid>                按 persistent ID 查一条（原生）
-//   music-cli check   <专辑名>              该专辑的轨数/路径/文件是否存在（原生）
-//   music-cli verify  [--json]             统计幽灵条目；有则 exit 3（后置门禁）
-//   music-cli add     <文件...>             把文件加入资料库（写）
-//   music-cli delete  --pid <pid>...        按 persistent ID 精确删除（写；默认预览）
-//   music-cli delete  --album <专辑名>       按专辑名删除（写；默认预览）
-//   music-cli delete  --missing             删除全部幽灵条目（写；默认预览）
-//   预览操作加 --yes 才真正执行。
+// Usage:
+//   music-cli dump    <out.jsonl>          export the whole library as JSONL (native)
+//   music-cli find    <query> [--json]     fuzzy search album / title / artist (native)
+//   music-cli info    <pid>                look up one item by persistent ID (native)
+//   music-cli check   <album>              track count, file paths, and whether files exist (native)
+//   music-cli verify  [--json]             count ghost entries; exits 3 if any (post-import gate)
+//   music-cli add     <file>...            add files to the library (write)
+//   music-cli delete  --pid <pid>...       delete by exact persistent ID (write; preview by default)
+//   music-cli delete  --album <album>      delete by album name (write; preview by default)
+//   music-cli delete  --missing            delete every ghost entry (write; preview by default)
+//   Pass --yes to actually run a previewed operation.
 //
-// 编译：见 Makefile，或
+// Build: see the Makefile, or
 //   clang -fobjc-arc -framework Foundation -framework iTunesLibrary \
 //         -o build/music-cli Sources/main.m
 //
-// 退出码：0 成功；1 一般错误；2 用法错误；3 verify 发现异常
+// Exit codes: 0 success; 1 general error; 2 usage error; 3 verify found anomalies
 #import <Foundation/Foundation.h>
 #import <iTunesLibrary/iTunesLibrary.h>
 
@@ -63,7 +66,8 @@ static ITLibrary *openLibrary(void) {
     return lib;
 }
 
-// 把一条 media item 转成 dict（字段与旧 dump-library 保持一致，下游无需改动）
+// Convert one media item into a dictionary. Field names match the legacy dump-library
+// output so downstream consumers need no changes.
 static NSDictionary *itemDict(ITLibMediaItem *item, NSISO8601DateFormatter *iso) {
     ITLibAlbum *album = item.album;
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
@@ -91,10 +95,12 @@ static NSDictionary *itemDict(ITLibMediaItem *item, NSISO8601DateFormatter *iso)
     return d;
 }
 
-// ---------- 写操作：唯一那条 AppleScript 路径 ----------
-// 说明：苹果未提供写入 API，add/delete 只能用 AppleScript。
-// 这里集中做三件事：(1) 用 persistent ID 精确匹配（不用专辑名，避免误删）；
-// (2) 分批 + 超时，避免整库扫描挂死；(3) 返回真实删除条数供上层复验。
+// ---------- Writes: the one and only AppleScript path ----------
+// Apple exposes no write API, so add/delete can only go through AppleScript.
+// This section centralises three things: (1) exact persistent-ID matching rather than
+// album names, to avoid deleting the wrong items; (2) batching plus timeouts, so a
+// library-wide scan cannot hang forever; (3) returning the real deleted count so callers
+// can verify the result.
 static int runAppleScript(NSString *src, NSTimeInterval timeout, NSString **outText) {
     NSTask *task = [NSTask new];
     task.launchPath = @"/usr/bin/osascript";
@@ -107,7 +113,7 @@ static int runAppleScript(NSString *src, NSTimeInterval timeout, NSString **outT
         fprintf(stderr, "ERR: failed to launch osascript: %s\n", err.localizedDescription.UTF8String);
         return 1;
     }
-    // 超时保护：AppleScript 在库忙时会挂死，不能无限等
+    // Timeout guard: AppleScript can hang while the library is busy, so never wait forever.
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     while (task.isRunning && [deadline timeIntervalSinceNow] > 0) {
         [NSThread sleepForTimeInterval:0.2];
@@ -142,17 +148,19 @@ static int cmdAdd(NSArray<NSString *> *paths) {
     return rc;
 }
 
-/// 把 persistent ID 归一成 AppleScript 需要的形式。
+/// Normalise a persistent ID into the form AppleScript expects.
 ///
-/// **这是本工具最容易踩的坑**：iTunesLibrary.framework 读出来的 persistentID 是
-/// **十进制**（`unsignedLongLongValue`，如 `14996906945997447858`），而 AppleScript 的
-/// `persistent ID` 属性返回/接受的是 **16 位十六进制串**（如 `D01FB7690DC422B2`）。
-/// 直接把十进制喂给 AppleScript 会**一条都匹配不上**，且不报错（静默删 0 条）。
-/// 这里统一接受两种输入：纯十进制数字 → 转 16 位大写十六进制；已是十六进制则原样保留。
+/// **This is the easiest trap in this tool.** iTunesLibrary.framework reports persistentID
+/// as a **decimal** number (`unsignedLongLongValue`, e.g. `14996906945997447858`), while
+/// AppleScript's `persistent ID` property takes and returns a **16-digit hex string**
+/// (e.g. `D01FB7690DC422B2`). Feeding the decimal straight to AppleScript matches nothing
+/// and does not error out — it silently deletes zero rows.
+/// Both forms are accepted here: a long all-digit value is converted to 16-digit uppercase
+/// hex; anything already hexadecimal is passed through.
 static NSString *normalizePersistentID(NSString *raw) {
     NSString *s = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
     NSString *upper = s.uppercaseString;
-    // 已经是合法十六进制串（1~16 位，含 A-F）→ 补零到 16 位直接用
+    // Already a valid hex string (1-16 chars, may contain A-F): use as-is, zero-padded.
     NSCharacterSet *hexSet = [NSCharacterSet characterSetWithCharactersInString:@"0123456789ABCDEF"];
     BOOL allHex = s.length > 0 && s.length <= 16;
     if (allHex) {
@@ -160,7 +168,7 @@ static NSString *normalizePersistentID(NSString *raw) {
             if (![hexSet characterIsMember:[upper characterAtIndex:i]]) { allHex = NO; break; }
         }
     }
-    // 纯数字且位数较长（>16 位）必然是十进制 → 转十六进制
+    // A long all-digit value (>16 chars) must be decimal: convert it to hex.
     BOOL allDigits = s.length > 0;
     for (NSUInteger i = 0; i < s.length; i++) {
         if (!isdigit((unsigned char)[s characterAtIndex:i])) { allDigits = NO; break; }
@@ -171,22 +179,24 @@ static NSString *normalizePersistentID(NSString *raw) {
     } else if (allHex) {
         value = strtoull(upper.UTF8String, NULL, 16);
     } else if (allDigits) {
-        value = strtoull(s.UTF8String, NULL, 10);   // 短纯数字：按十进制理解
+        value = strtoull(s.UTF8String, NULL, 10);   // short all-digit value: treat as decimal
     } else {
-        return upper;                                // 兜底：原样（含非法字符时交给 AppleScript 报错）
+        return upper;                                // fallback: pass through and let AppleScript complain
     }
     return [NSString stringWithFormat:@"%016llX", value];
 }
 
-/// 删除后**回读实时库**确认是否真的消失。
+/// Re-open the live library after deleting and confirm the items are really gone.
 ///
-/// 为什么必须回读：Music 的删除是**异步落库**的，AppleScript 返回的计数只代表脚本执行完，
-/// 不代表库已经写完。曾经踩过：删完立刻用**旧快照**复查，以为"删了但还在"，
-/// 实际是快照过期（真删成功了）；反过来也可能出现脚本报成功、库却没删。
-/// 因此唯一可信的判定是「删完 → 重新打开库 → 看还在不在」。
+/// Why this is required: Music persists deletions **asynchronously**. The count returned by
+/// AppleScript only means the script finished, not that the library write landed. This bit
+/// us once already: re-checking straight after a delete against a **stale dump** made it look
+/// like the items were still present when they had in fact been removed. The reverse is also
+/// possible — the script reports success while the library keeps the rows.
+/// So the only trustworthy check is: delete -> reopen the library -> see whether they remain.
 static NSInteger countStillPresent(NSArray<NSString *> *hexIDs) {
     ITLibrary *lib = [ITLibrary libraryWithAPIVersion:@"1.0" error:nil];
-    if (!lib) return -1;                       // -1 表示无法判定，交由调用方提示
+    if (!lib) return -1;                       // -1 means undeterminable; the caller warns
     NSMutableSet<NSString *> *want = [NSMutableSet setWithArray:hexIDs];
     NSInteger still = 0;
     for (ITLibMediaItem *item in lib.allMediaItems) {
@@ -200,7 +210,7 @@ static int cmdDeletePids(NSArray<NSString *> *pids, BOOL apply) {
     if (pids.count == 0) { fprintf(stderr, "usage: music-cli delete --pid <pid>...\n"); return 2; }
     NSMutableArray<NSString *> *norm = [NSMutableArray arrayWithCapacity:pids.count];
     for (NSString *p in pids) [norm addObject:normalizePersistentID(p)];
-    // 去重：同一个 ID 传两次会让"删除数不符"误报
+    // De-duplicate: passing the same ID twice triggers a bogus "deleted fewer than requested".
     NSMutableArray<NSString *> *uniq = [NSMutableArray array];
     NSMutableSet<NSString *> *seen = [NSMutableSet set];
     for (NSString *h in norm) if (![seen containsObject:h]) { [seen addObject:h]; [uniq addObject:h]; }
@@ -215,12 +225,13 @@ static int cmdDeletePids(NSArray<NSString *> *pids, BOOL apply) {
         printf("pass --yes to actually run\n");
         return 0;
     }
-    // 分批（每批 10 条），避免单条 AppleScript 过长导致挂死。
+    // Batch 10 at a time so a single AppleScript invocation cannot grow large enough to hang.
     //
-    // 定位方式用 persistent ID：`iTunesLibrary.framework` **只暴露 persistentID**
-    // （ITLibMediaEntity 上除此之外没有 databaseID），所以无法从这里拿到 AppleScript 的
-    // `database ID`。persistent ID 查询本身是可靠的 —— 之前怀疑它"静默失败"，
-    // 真正的原因是复查时读了**过期快照**（删除其实成功了）。
+    // Lookup uses the persistent ID: `iTunesLibrary.framework` **exposes only persistentID**
+    // (ITLibMediaEntity has no databaseID), so AppleScript's `database ID` is not reachable
+    // from here. The persistent ID lookup itself is reliable — an earlier suspicion that it
+    // "fails silently" turned out to be a **stale dump** read during verification; the
+    // deletions had actually succeeded.
     NSInteger total = 0;
     for (NSUInteger i = 0; i < norm.count; i += 10) {
         NSUInteger n = MIN((NSUInteger)10, norm.count - i);
@@ -237,7 +248,7 @@ static int cmdDeletePids(NSArray<NSString *> *pids, BOOL apply) {
         printf("  batch %lu: deleted %ld\n", (unsigned long)(i / 10 + 1), (long)got);
     }
 
-    // 回读实时库确认（异步落库，必须等一拍再看）
+    // Re-read the live library to confirm (writes are async, so give it a beat first).
     [NSThread sleepForTimeInterval:2.0];
     NSInteger still = countStillPresent(norm);
     printf("deleted %ld / %lu\n", (long)total, (unsigned long)norm.count);
@@ -271,7 +282,7 @@ static int cmdDeleteAlbum(NSString *album, BOOL apply) {
     return cmdDeletePids(pids, YES);
 }
 
-// 删除"记录在册但文件已删"的幽灵条目（本次会话反复需要的操作）
+// Delete "ghost" entries: recorded in the library but whose files are gone.
 static int cmdDeleteMissing(BOOL apply) {
     ITLibrary *lib = openLibrary();
     if (!lib) return 1;
@@ -280,8 +291,8 @@ static int cmdDeleteMissing(BOOL apply) {
     NSMutableArray *desc = [NSMutableArray array];
     for (ITLibMediaItem *item in lib.allMediaItems) {
         NSString *path = item.location.path;
-        if (path.length == 0) continue;              // 无 location 的条目（如 Apple Music 串流）不算幽灵
-        if ([fm fileExistsAtPath:path]) continue;    // 文件在，正常
+        if (path.length == 0) continue;              // no location (e.g. streaming) is not a ghost
+        if ([fm fileExistsAtPath:path]) continue;    // file present: fine
         [pids addObject:[NSString stringWithFormat:@"%llu", item.persistentID.unsignedLongLongValue]];
         [desc addObject:[NSString stringWithFormat:@"%@ / %@ / %@",
                          item.album.title ?: @"?", item.artist.name ?: @"?", item.title ?: @"?"]];
@@ -294,7 +305,7 @@ static int cmdDeleteMissing(BOOL apply) {
     return cmdDeletePids(pids, YES);
 }
 
-// ---------- 读操作 ----------
+// ---------- Reads ----------
 static int cmdDump(NSString *outPath) {
     ITLibrary *lib = openLibrary();
     if (!lib) return 1;
@@ -367,7 +378,7 @@ static int cmdInfo(NSString *pidStr) {
     return 1;
 }
 
-// 替代 AppleScript `whose album is`（那个查询不稳定，本次会话被坑多次）
+// Replaces AppleScript's `whose album is`, which is unreliable.
 static int cmdCheck(NSString *album) {
     ITLibrary *lib = openLibrary();
     if (!lib) return 1;
@@ -394,7 +405,7 @@ static int cmdCheck(NSString *album) {
     return 0;
 }
 
-// 后置门禁：统计幽灵条目 + 同名专辑重复
+// Post-import gate: count ghost entries.
 static int cmdVerify(BOOL asJson) {
     ITLibrary *lib = openLibrary();
     if (!lib) return 1;
